@@ -9,6 +9,25 @@ import type {
   OpenCodeModel,
 } from "./types";
 
+/**
+ * AX Pipeline — DSPy-like orchestration for Knowledge Graph generation
+ *
+ * This pipeline implements the same DSPy-inspired patterns from the
+ * ax-opencode-translator project:
+ *
+ * - compileRefinePrompt: Like DSPy's Module.compile() — produces focused
+ *   refinement prompts based on error history, not generic retries
+ * - ErrorEntry tracking: Full error history for surgical, targeted fixes
+ * - resumeFrom state machine: Deterministic pipeline progression
+ * - Activity-style discrete steps: extract → link → validate → refine
+ *
+ * Pipeline flow:
+ * 1. Extract concepts (with 1500-char chunking for large inputs)
+ * 2. Link relationships between concepts
+ * 3. Validate graph quality (self-critique)
+ * 4. If validation fails, refine with compiled error context (up to N iterations)
+ */
+
 // ─── Constants ─────────────────────────────────────────────────
 
 /** Maximum characters per chunk for extraction.
@@ -18,6 +37,15 @@ const CHUNK_CHAR_LIMIT = 1500;
 
 /** Minimum characters that trigger chunked processing */
 const CHUNK_THRESHOLD = 1000;
+
+// ─── DSPy-style Error Tracking ─────────────────────────────────
+
+interface ErrorEntry {
+  attempt: number;
+  stage: "extract" | "link" | "validate" | "refine";
+  error: string;
+  issues?: string[];
+}
 
 // ─── System Prompt ─────────────────────────────────────────────
 
@@ -38,12 +66,52 @@ CRITICAL OUTPUT RULES:
 - Do NOT repeat the input text verbatim in summaries — distill the core idea.
 - Avoid overly verbose edge labels — use 1-3 word specific verbs.`;
 
+// ─── compileRefinePrompt — pure function (DSPy-like) ──────────────
+// Like DSPy's Module.compile() — produces focused prompts based on error history.
+// This is the ONLY place refinement prompt construction happens.
+// Pattern adopted from ax-opencode-translator's compileTranslatePrompt().
+
+function compileRefinePrompt(
+  issues: string[],
+  errorHistory: ErrorEntry[],
+  stage: "extract" | "link" | "validate" | "refine"
+): string {
+  // No errors yet — this is initial context
+  if (errorHistory.length === 0 && issues.length === 0) {
+    return `Initial ${stage} request for knowledge graph generation`;
+  }
+
+  // Build surgical context from error history (Mode B: surgical fix)
+  const latestError = errorHistory.length > 0
+    ? errorHistory[errorHistory.length - 1]
+    : null;
+  const previousErrors = errorHistory.slice(0, -1).map(e =>
+    `  Attempt ${e.attempt} | ${e.stage}: ${e.error.substring(0, 200)}`
+  ).join("\n");
+
+  const issueContext = issues.length > 0
+    ? `\nValidation issues to fix:\n${issues.map(i => `  - ${i}`).join("\n")}`
+    : "";
+
+  const errorContext = latestError
+    ? `\nLatest error (attempt ${latestError.attempt}, stage ${latestError.stage}): ${latestError.error.substring(0, 300)}
+${latestError.issues ? `Issues: ${latestError.issues.join(", ")}` : ""}`
+    : "";
+
+  const previousContext = previousErrors.length > 0
+    ? `\nPrevious errors — do NOT repeat these patterns:\n${previousErrors}`
+    : "";
+
+  return `Refinement context for stage "${stage}":${issueContext}${errorContext}${previousContext}`;
+}
+
 // ─── AX Pipeline ───────────────────────────────────────────────
 
 export class AXPipeline {
   private client: OpenCodeClient;
   private onIteration: (log: IterationLog) => void;
   private rawNotes: string = "";
+  private errorHistory: ErrorEntry[] = [];
 
   constructor(
     apiKey: string,
@@ -75,16 +143,25 @@ export class AXPipeline {
 
   /**
    * Wrap an async API call with rate-limit / transient error detection.
+   * Records errors to errorHistory for DSPy-style compileRefinePrompt().
    */
   private async callWithRetryAwareness<T>(
     fn: () => Promise<T>,
     iteration: number,
-    phaseLabel: string
+    phaseLabel: string,
+    stage: ErrorEntry["stage"]
   ): Promise<T> {
     try {
       return await fn();
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
+
+      // Track error in history for DSPy-style compiled prompts
+      this.errorHistory.push({
+        attempt: iteration,
+        stage,
+        error: msg,
+      });
 
       const isRateLimit =
         msg.includes("rate limit") ||
@@ -250,10 +327,11 @@ ${chunk}`;
 
   private async extract(
     rawNotes: string,
-    previousResult: LinkResult | null
+    previousResult: LinkResult | null,
+    issues: string[]
   ): Promise<ExtractResult> {
     if (previousResult) {
-      return this.extractRefinement(rawNotes, previousResult);
+      return this.extractRefinement(rawNotes, previousResult, issues);
     }
 
     const chunks = this.splitIntoChunks(rawNotes);
@@ -288,7 +366,8 @@ ${chunk}`;
         const chunkResult = await this.callWithRetryAwareness(
           () => this.extractChunk(chunks[i], i, chunks.length),
           1,
-          `Extract (section ${i + 1}/${chunks.length})`
+          `Extract (section ${i + 1}/${chunks.length})`,
+          "extract"
         );
 
         chunkResult.nodes.forEach((node) => {
@@ -333,10 +412,20 @@ ${chunk}`;
     return { nodes: deduplicated };
   }
 
+  /**
+   * Refinement extraction using DSPy-compiled prompt from error history.
+   * Like ax-opencode-translator's compileTranslatePrompt() — builds a
+   * surgical fix prompt instead of a generic retry.
+   */
   private async extractRefinement(
     rawNotes: string,
-    previousResult: LinkResult | null
+    previousResult: LinkResult | null,
+    issues: string[]
   ): Promise<ExtractResult> {
+    // Compile DSPy-style refinement context
+    const fixContext = compileRefinePrompt(issues, this.errorHistory, "extract");
+    console.log(`[AX Pipeline] Extract refinement context: ${fixContext.substring(0, 200)}`);
+
     const nodesCompact = previousResult?.nodes
       ?.slice(0, 50)
       .map((n) => `${n.id}: ${n.title}`)
@@ -356,6 +445,7 @@ Fix rules:
 - Split genuinely non-atomic concepts
 - Keep all existing valid concepts unchanged
 - Be CONCISE: short titles, brief summaries
+- ${fixContext}
 
 Return JSON: { "nodes": [{ "id": "c1", "title": "...", "summary": "...", "tags": ["..."] }] }`;
 
@@ -487,12 +577,16 @@ Only list issues affecting MEANING or STRUCTURE.`;
     };
   }
 
-  // ─── Step 4: REFINE — targeted fixes only ────────────────────
+  // ─── Step 4: REFINE — targeted fixes using DSPy-compiled prompt ──
 
   private async refine(
     graph: LinkResult,
     issues: string[]
   ): Promise<LinkResult> {
+    // Compile DSPy-style refinement context from error history
+    const fixContext = compileRefinePrompt(issues, this.errorHistory, "refine");
+    console.log(`[AX Pipeline] Refinement context: ${fixContext.substring(0, 200)}`);
+
     const graphCompact = {
       nodes: graph.nodes.map((n) => ({ id: n.id, title: n.title, summary: n.summary, tags: n.tags })),
       edges: graph.edges.map((e) => ({ source: e.source, target: e.target, label: e.label, strength: e.strength })),
@@ -508,6 +602,7 @@ Rules:
 - Non-atomic concept? SPLIT into two and link.
 - No speculative additions.
 - Be CONCISE: short titles, brief summaries, 1-3 word edge labels.
+- ${fixContext}
 
 Return the FULL corrected graph (both nodes and edges). Keep unchanged items as-is.
 
@@ -555,7 +650,9 @@ Current graph: ${JSON.stringify(graphCompact)}`;
     };
   }
 
-  // ─── Main Pipeline Runner ──────────────────────────────────────
+  // ─── Main Pipeline Runner (resumeFrom state machine) ───────────
+  // Like ax-opencode-translator's resumeFrom pattern — deterministic
+  // pipeline progression with state tracking.
 
   async run(
     rawNotes: string,
@@ -563,95 +660,163 @@ Current graph: ${JSON.stringify(graphCompact)}`;
     threshold: number
   ): Promise<PipelineResult> {
     this.rawNotes = rawNotes;
+    this.errorHistory = []; // Reset error history for new pipeline run
     let result: LinkResult | null = null;
     let score = 0;
     let attempt = 0;
+    let currentIssues: string[] = [];
     const iterLogs: IterationLog[] = [];
 
-    while (attempt < iterations && score < threshold) {
+    // State machine: extract → link → validate → refine → done
+    type PipelineStage = "extract" | "link" | "validate" | "refine" | "done";
+    let resumeFrom: PipelineStage = "extract";
+
+    while (attempt < iterations && score < threshold && resumeFrom !== "done") {
       attempt++;
 
-      this.emit("extracting", attempt, 0, false);
-      let extracted: ExtractResult;
-      try {
-        extracted = await this.callWithRetryAwareness(
-          () => this.extract(rawNotes, result),
-          attempt,
-          "Extract"
-        );
-      } catch (extractError) {
-        if (result) {
-          console.warn("[AX Pipeline] Extract failed, using previous result");
-          extracted = { nodes: result.nodes };
-        } else {
-          throw extractError;
-        }
-      }
-
-      this.emit("linking", attempt, 0, false);
-      let linked: LinkResult;
-      try {
-        linked = await this.callWithRetryAwareness(
-          () => this.link(extracted),
-          attempt,
-          "Link"
-        );
-      } catch (linkError) {
-        console.warn("[AX Pipeline] Link failed, using nodes without edges");
-        linked = { nodes: extracted.nodes, edges: [] };
-      }
-
-      this.emit("validating", attempt, 0, false);
-      try {
-        const validation = await this.callWithRetryAwareness(
-          () => this.validate(linked),
-          attempt,
-          "Validate"
-        );
-        score = validation.score;
-
-        const passed = score >= threshold;
-        this.emit("validating", attempt, score, passed, validation.issues);
-
-        iterLogs.push({
-          iteration: attempt,
-          phase: passed ? "complete" : "validating",
-          score,
-          passed,
-          issues: validation.issues,
-          timestamp: Date.now(),
-        });
-
-        if (score < threshold && attempt < iterations) {
-          this.emit("refining", attempt, score, false);
-          try {
-            result = await this.callWithRetryAwareness(
-              () => this.refine(linked, validation.issues),
-              attempt,
-              "Refine"
-            );
-          } catch (refineError) {
-            console.warn("[AX Pipeline] Refine failed, using linked result");
-            result = linked;
+      // ─── Stage 1: EXTRACT ──────────────────────────────────────
+      if (resumeFrom === "extract") {
+        this.emit("extracting", attempt, 0, false);
+        let extracted: ExtractResult;
+        try {
+          extracted = await this.callWithRetryAwareness(
+            () => this.extract(rawNotes, result, currentIssues),
+            attempt,
+            "Extract",
+            "extract"
+          );
+          resumeFrom = "link";
+        } catch (extractError) {
+          if (result) {
+            console.warn("[AX Pipeline] Extract failed, using previous result");
+            extracted = { nodes: result.nodes };
+            resumeFrom = "link";
+          } else {
+            throw extractError;
           }
-        } else {
-          result = linked;
         }
-      } catch (validateError) {
-        console.warn("[AX Pipeline] Validate failed, using default score");
-        score = 0.7;
-        result = linked;
+      }
 
-        iterLogs.push({
-          iteration: attempt,
-          phase: "validating",
-          score,
-          passed: score >= threshold,
-          issues: ["Validation step failed — using estimated score"],
-          timestamp: Date.now(),
-        });
+      // ─── Stage 2: LINK ─────────────────────────────────────────
+      if (resumeFrom === "link") {
+        this.emit("linking", attempt, 0, false);
+        let linked: LinkResult;
+        try {
+          // Re-extract if needed for the link step
+          const extracted = await this.callWithRetryAwareness(
+            () => this.extract(rawNotes, result, currentIssues),
+            attempt,
+            "Extract for Link",
+            "extract"
+          );
+          linked = await this.callWithRetryAwareness(
+            () => this.link(extracted),
+            attempt,
+            "Link",
+            "link"
+          );
+          resumeFrom = "validate";
+        } catch (linkError) {
+          console.warn("[AX Pipeline] Link failed, using nodes without edges");
+          const extracted = await this.extract(rawNotes, result, currentIssues).catch(() => ({
+            nodes: result?.nodes || [],
+          }));
+          linked = { nodes: extracted.nodes, edges: [] };
+          resumeFrom = "validate";
+        }
+      }
 
-        if (score >= threshold) break;
+      // ─── Stage 3: VALIDATE ─────────────────────────────────────
+      if (resumeFrom === "validate") {
+        this.emit("validating", attempt, 0, false);
+        try {
+          // Get the latest linked result
+          const extracted = await this.callWithRetryAwareness(
+            () => this.extract(rawNotes, result, currentIssues),
+            attempt,
+            "Extract for Validate",
+            "extract"
+          );
+          const linked = await this.callWithRetryAwareness(
+            () => this.link(extracted),
+            attempt,
+            "Link for Validate",
+            "link"
+          );
+
+          const validation = await this.callWithRetryAwareness(
+            () => this.validate(linked),
+            attempt,
+            "Validate",
+            "validate"
+          );
+          score = validation.score;
+          currentIssues = validation.issues;
+
+          const passed = score >= threshold;
+          this.emit("validating", attempt, score, passed, validation.issues);
+
+          iterLogs.push({
+            iteration: attempt,
+            phase: passed ? "complete" : "validating",
+            score,
+            passed,
+            issues: validation.issues,
+            timestamp: Date.now(),
+          });
+
+          if (passed) {
+            result = linked;
+            resumeFrom = "done";
+          } else if (attempt < iterations) {
+            resumeFrom = "refine";
+          } else {
+            result = linked;
+            resumeFrom = "done";
+          }
+        } catch (validateError) {
+          console.warn("[AX Pipeline] Validate failed, using default score");
+          score = 0.7;
+          result = { nodes: result?.nodes || [], edges: result?.edges || [] };
+          currentIssues = ["Validation step failed — using estimated score"];
+
+          iterLogs.push({
+            iteration: attempt,
+            phase: "validating",
+            score,
+            passed: score >= threshold,
+            issues: currentIssues,
+            timestamp: Date.now(),
+          });
+
+          if (score >= threshold) {
+            resumeFrom = "done";
+          } else if (attempt < iterations) {
+            resumeFrom = "refine";
+          } else {
+            resumeFrom = "done";
+          }
+        }
+      }
+
+      // ─── Stage 4: REFINE (DSPy-compiled prompt) ────────────────
+      if (resumeFrom === "refine") {
+        this.emit("refining", attempt, score, false);
+        try {
+          const refined = await this.callWithRetryAwareness(
+            () => this.refine(result!, currentIssues),
+            attempt,
+            "Refine",
+            "refine"
+          );
+          result = refined;
+          // After refine, loop back to validate
+          resumeFrom = "validate";
+        } catch (refineError) {
+          console.warn("[AX Pipeline] Refine failed, using current result");
+          // Keep current result, loop back to validate
+          resumeFrom = "validate";
+        }
       }
     }
 

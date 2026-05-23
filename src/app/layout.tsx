@@ -22,7 +22,7 @@ export const metadata: Metadata = {
     "atomic notes",
     "Obsidian",
     "AI",
-    "Nvidia NIM",
+    "OpenCode API",
     "DSPy",
     "semantic reasoning",
   ],
