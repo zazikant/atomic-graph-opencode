@@ -1,0 +1,229 @@
+import { create } from "zustand";
+import type {
+  AtomicNode,
+  GraphEdge,
+  IterationLog,
+  OpenCodeModel,
+  AppConfig,
+} from "@/lib/types";
+import { CLUSTER_COLORS } from "@/lib/types";
+import { buildFlowGraph, applyDagreLayout } from "@/lib/graphLayout";
+import type { Node, Edge } from "@xyflow/react";
+import type { NodeCardData } from "@/lib/types";
+
+// No hardcoded API key — the server uses process.env.OPENCODE_API_KEY.
+// Users can optionally provide their own key via the UI as an override.
+const DEFAULT_API_KEY = "";
+
+// ─── Store Interface ─────────────────────────────────────────
+
+interface GraphStore {
+  // Config
+  config: AppConfig;
+  setConfig: (partial: Partial<AppConfig>) => void;
+
+  // Notes input
+  rawNotes: string;
+  setRawNotes: (notes: string) => void;
+
+  // Pipeline state
+  isRunning: boolean;
+  iterationLogs: IterationLog[];
+  pipelineError: string | null;
+  pipelineScore: number;
+  pipelineAttempts: number;
+
+  // Graph data
+  flowNodes: Node<NodeCardData>[];
+  flowEdges: Edge[];
+  selectedNodeId: string | null;
+
+  // Actions
+  setIterationLogs: (logs: IterationLog[]) => void;
+  addIterationLog: (log: IterationLog) => void;
+  setIsRunning: (running: boolean) => void;
+  setPipelineError: (error: string | null) => void;
+  setPipelineResult: (nodes: Node<NodeCardData>[], edges: Edge[], score: number, attempts: number) => void;
+  setSelectedNodeId: (id: string | null) => void;
+  updateNodePositions: (nodes: Node<NodeCardData>[]) => void;
+  resetPipeline: () => void;
+  importGraphFromJSON: (json: string) => { success: boolean; error?: string };
+}
+
+// ─── Persist API key to localStorage ────────────────────────
+
+function loadStoredConfig(): AppConfig {
+  if (typeof window === "undefined") {
+    return {
+      apiKey: DEFAULT_API_KEY,
+      model: "glm-5.1",
+      iterations: 3,
+      confidenceThreshold: 0.75,
+    };
+  }
+  try {
+    const stored = localStorage.getItem("atomic-graph-config");
+    if (stored) {
+      const parsed = JSON.parse(stored);
+      // Always ensure model is the current default
+      return { ...parsed, model: "glm-5.1" };
+    }
+  } catch {
+    // ignore
+  }
+  return {
+    apiKey: DEFAULT_API_KEY,
+    model: "glm-5.1",
+    iterations: 3,
+    confidenceThreshold: 0.75,
+  };
+}
+
+function saveConfig(config: AppConfig) {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.setItem("atomic-graph-config", JSON.stringify(config));
+  } catch {
+    // ignore
+  }
+}
+
+// ─── Store ───────────────────────────────────────────────────
+
+export const useGraphStore = create<GraphStore>((set, get) => ({
+  // Config
+  config: loadStoredConfig(),
+  setConfig: (partial) => {
+    const newConfig = { ...get().config, ...partial };
+    saveConfig(newConfig);
+    set({ config: newConfig });
+  },
+
+  // Notes
+  rawNotes: "",
+  setRawNotes: (notes) => set({ rawNotes: notes }),
+
+  // Pipeline
+  isRunning: false,
+  iterationLogs: [],
+  pipelineError: null,
+  pipelineScore: 0,
+  pipelineAttempts: 0,
+
+  // Graph
+  flowNodes: [],
+  flowEdges: [],
+  selectedNodeId: null,
+
+  // Actions
+  setIterationLogs: (logs) => set({ iterationLogs: logs }),
+  addIterationLog: (log) =>
+    set((state) => ({ iterationLogs: [...state.iterationLogs, log] })),
+
+  setIsRunning: (running) => set({ isRunning: running }),
+  setPipelineError: (error) => set({ pipelineError: error }),
+
+  setPipelineResult: (nodes, edges, score, attempts) =>
+    set({
+      flowNodes: nodes,
+      flowEdges: edges,
+      pipelineScore: score,
+      pipelineAttempts: attempts,
+      isRunning: false,
+    }),
+
+  setSelectedNodeId: (id) => set({ selectedNodeId: id }),
+
+  updateNodePositions: (nodes) => set({ flowNodes: nodes }),
+
+  resetPipeline: () =>
+    set({
+      isRunning: false,
+      iterationLogs: [],
+      pipelineError: null,
+      pipelineScore: 0,
+      pipelineAttempts: 0,
+      flowNodes: [],
+      flowEdges: [],
+      selectedNodeId: null,
+    }),
+
+  importGraphFromJSON: (json: string) => {
+    try {
+      const data = JSON.parse(json);
+
+      // Validate structure
+      if (!data.nodes || !Array.isArray(data.nodes) || data.nodes.length === 0) {
+        return { success: false, error: "JSON must contain a non-empty 'nodes' array." };
+      }
+      if (!data.edges || !Array.isArray(data.edges)) {
+        return { success: false, error: "JSON must contain an 'edges' array." };
+      }
+
+      // Map to AtomicNode[]
+      const atomicNodes: AtomicNode[] = data.nodes.map((n: any, i: number) => ({
+        id: n.id || `n${i}`,
+        title: n.title || `Node ${i + 1}`,
+        summary: n.summary || "",
+        tags: Array.isArray(n.tags) ? n.tags : [],
+        content: n.content || n.summary || "",
+        cluster: n.cluster,
+      }));
+
+      // Map to GraphEdge[]
+      const graphEdges: GraphEdge[] = data.edges
+        .map((e: any, i: number) => ({
+          source: e.source,
+          target: e.target,
+          label: e.label || e.data?.label || "",
+          strength: e.strength ?? e.data?.strength ?? 0.5,
+        }))
+        .filter((e: GraphEdge) => e.source && e.target);
+
+      // Validate that edge references exist
+      const nodeIds = new Set(atomicNodes.map((n) => n.id));
+      const validEdges = graphEdges.filter(
+        (e) => nodeIds.has(e.source) && nodeIds.has(e.target)
+      );
+
+      if (validEdges.length === 0 && graphEdges.length > 0) {
+        return { success: false, error: "Edge source/target IDs don't match any node IDs." };
+      }
+
+      // Build the flow graph
+      const { nodes, edges } = buildFlowGraph(
+        atomicNodes,
+        validEdges,
+        CLUSTER_COLORS,
+        (id) => get().setSelectedNodeId(id)
+      );
+
+      const laidOutNodes = applyDagreLayout(nodes, edges);
+
+      set({
+        flowNodes: laidOutNodes,
+        flowEdges: edges,
+        pipelineScore: 1.0,
+        pipelineAttempts: 1,
+        isRunning: false,
+        pipelineError: null,
+        selectedNodeId: null,
+        iterationLogs: [
+          {
+            iteration: 1,
+            phase: "complete",
+            score: 1.0,
+            passed: true,
+            detail: "Imported from JSON",
+            timestamp: Date.now(),
+          },
+        ],
+      });
+
+      return { success: true };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Invalid JSON format";
+      return { success: false, error: `Parse error: ${message}` };
+    }
+  },
+}));
