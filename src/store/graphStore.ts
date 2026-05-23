@@ -59,6 +59,7 @@ function loadStoredConfig(): AppConfig {
       model: "glm-5.1",
       iterations: 3,
       confidenceThreshold: 0.75,
+      fastMode: true,
     };
   }
   try {
@@ -76,6 +77,7 @@ function loadStoredConfig(): AppConfig {
     model: "glm-5.1",
     iterations: 3,
     confidenceThreshold: 0.75,
+    fastMode: true,
   };
 }
 

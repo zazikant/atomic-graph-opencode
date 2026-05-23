@@ -6,7 +6,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Slider } from "@/components/ui/slider";
 import { Badge } from "@/components/ui/badge";
-import { Settings, Key, Cpu, RotateCcw, Target, ChevronDown, ChevronUp, CheckCircle2 } from "lucide-react";
+import { Settings, Key, Cpu, RotateCcw, Target, ChevronDown, ChevronUp, CheckCircle2, Zap } from "lucide-react";
 
 export function ConfigBar() {
   const { config, setConfig } = useGraphStore();
@@ -87,6 +87,21 @@ export function ConfigBar() {
           >
             GLM 5.1
           </Badge>
+        </div>
+
+        {/* Fast Mode Toggle */}
+        <div className="flex items-center gap-1.5">
+          <Zap className={`w-3.5 h-3.5 shrink-0 ${config.fastMode ? "text-amber-400" : "text-[#8888cc]"}`} />
+          <button
+            onClick={() => setConfig({ fastMode: !config.fastMode })}
+            className={`flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-mono border transition-colors ${
+              config.fastMode
+                ? "bg-amber-500/20 border-amber-500/40 text-amber-300"
+                : "bg-[#1a1a3e] border-[#3a3a6a] text-[#8888cc] hover:text-[#c8c8ee]"
+            }`}
+          >
+            Fast
+          </button>
         </div>
 
         {/* Iterations Slider */}

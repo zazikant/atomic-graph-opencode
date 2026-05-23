@@ -60,6 +60,9 @@ export interface AppConfig {
   model: OpenCodeModel;
   iterations: number;
   confidenceThreshold: number;
+  /** Fast mode: Extract+Link only (skip validate/refine). Default: true.
+   *  Like repo 2's runFastTranslation — cuts 3-5 LLM calls to just 2. */
+  fastMode: boolean;
 }
 
 export type OpenCodeModel = "glm-5.1";

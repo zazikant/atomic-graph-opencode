@@ -789,6 +789,71 @@ Current graph: ${JSON.stringify(graphCompact)}`;
     };
   }
 
+  // ─── Fast Pipeline (like repo 2's runFastTranslation) ────────────
+  // Extract + Link only, skip validate/refine.
+  // Cuts pipeline from 3-5 LLM calls to just 2 (extract + link).
+  // ~30-60s total instead of 90-150s.
+
+  async runFast(
+    rawNotes: string
+  ): Promise<PipelineResult> {
+    this.rawNotes = rawNotes;
+    this.errorHistory = [];
+
+    // ─── Stage 1: EXTRACT ──────────────────────────────────────────
+    this.emit("extracting", 1, 0, false);
+    let extracted: ExtractResult;
+    try {
+      extracted = await this.callWithRetryAwareness(
+        () => this.extract(rawNotes, null, []),
+        1,
+        "Extract",
+        "extract"
+      );
+
+      // Echo detection
+      if (isEcho(rawNotes, JSON.stringify(extracted))) {
+        console.log("[AX Pipeline] Echo detected — retrying with forceful prompt");
+        try {
+          extracted = await this.callWithRetryAwareness(
+            () => this.extract(rawNotes, null, []),
+            1,
+            "Extract (echo retry)",
+            "extract"
+          );
+        } catch {
+          // Retry failed, use original result
+        }
+      }
+    } catch (extractError) {
+      throw extractError;
+    }
+
+    // ─── Stage 2: LINK ─────────────────────────────────────────────
+    this.emit("linking", 1, 0, false);
+    let result: LinkResult;
+    try {
+      result = await this.callWithRetryAwareness(
+        () => this.link(extracted),
+        1,
+        "Link",
+        "link"
+      );
+    } catch (linkError) {
+      console.warn("[AX Pipeline] Link failed, using nodes without edges");
+      result = { nodes: extracted.nodes, edges: [] };
+    }
+
+    this.emit("complete", 1, 0.85, true, undefined, "Fast mode — graph generated");
+
+    return {
+      result,
+      score: 0.85, // Estimated — no validation step
+      attempts: 1,
+      iterations: [],
+    };
+  }
+
   // ─── Main Pipeline Runner (resumeFrom state machine) ───────────
   // Like ax-opencode-translator's resumeFrom pattern — deterministic
   // pipeline progression with state tracking.
