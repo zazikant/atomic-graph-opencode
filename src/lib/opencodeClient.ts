@@ -20,6 +20,53 @@ import type { OpenCodeModel } from "./types";
 
 const DEFAULT_MODEL: OpenCodeModel = "glm-5.1";
 
+// ─── Token Estimation (from ax-opencode-translator) ──────────
+// Rough: 1 token ≈ 4 chars for English, 2 chars for CJK
+
+export function estimateTokens(text: string): number {
+  const cjkChars = (text.match(/[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/g) || []).length;
+  const otherChars = text.length - cjkChars;
+  return Math.ceil(cjkChars / 2 + otherChars / 4);
+}
+
+/**
+ * Calculate max_tokens for the output based on input length.
+ * With reasoning_effort: "none", thinking is OFF — all tokens go to content.
+ * No need to reserve tokens for reasoning, so minimum can be lower.
+ *
+ * For knowledge graph extraction, output can be 2-3× the input
+ * (notes → structured graph with nodes and edges).
+ * For validation, output is small JSON (~1024 is enough).
+ *
+ * Minimum 2048, maximum 8192.
+ */
+export function calculateMaxTokens(inputText: string, stage: 'extract' | 'link' | 'validate' | 'refine' = 'extract'): number {
+  // Validation returns small JSON — fixed 1024 is enough
+  if (stage === 'validate') return 1024;
+
+  const inputTokens = estimateTokens(inputText);
+  // Knowledge graph extraction produces structured output ≈ 2× input
+  const multiplier = stage === 'extract' ? 2 : 1.5;
+  const outputTokens = Math.ceil(inputTokens * multiplier);
+  // With reasoning_effort "none", no tokens are consumed by reasoning
+  return Math.max(2048, Math.min(8192, outputTokens));
+}
+
+/**
+ * Stage-specific temperature settings from ax-opencode-translator.
+ * Lower temperature = more deterministic/focused output.
+ * Higher temperature = more creative/diverse output.
+ */
+export function getStageTemperature(stage: 'extract' | 'link' | 'validate' | 'refine'): number {
+  switch (stage) {
+    case 'extract': return 0.3;  // Focused, deterministic concept extraction
+    case 'link': return 0.3;     // Focused, precise relationship mapping
+    case 'validate': return 0.1; // Very deterministic — objective quality assessment
+    case 'refine': return 0.2;   // Slightly creative — targeted fixes
+    default: return 0.3;
+  }
+}
+
 export class OpenCodeClient {
   private apiKey: string;
   private model: OpenCodeModel;
@@ -41,8 +88,15 @@ export class OpenCodeClient {
    *
    * The proxy retries up to 3 times on 429/5xx errors with 15s delay.
    * If all retries are exhausted, throws a descriptive error.
+   *
+   * AX DSPy-style: temperature and max_tokens are stage-specific.
+   * Each pipeline stage has its own optimal temperature for quality.
    */
-  async chat(userPrompt: string, systemPrompt?: string): Promise<string> {
+  async chat(
+    userPrompt: string,
+    systemPrompt?: string,
+    options?: { temperature?: number; max_tokens?: number }
+  ): Promise<string> {
     const messages: { role: "system" | "user" | "assistant"; content: string }[] = [];
 
     if (systemPrompt) {
@@ -60,8 +114,8 @@ export class OpenCodeClient {
         apiKey: this.apiKey,
         model: this.model,
         messages,
-        temperature: 0.7,
-        max_tokens: 16384,
+        temperature: options?.temperature ?? 0.3,
+        max_tokens: options?.max_tokens ?? 4096,
       }),
     });
 
@@ -144,8 +198,12 @@ export class OpenCodeClient {
    * 3. If recovery returns partial data, return it (caller decides how to handle)
    * 4. If all recovery fails, throw the original parse error
    */
-  async chatJSON<T>(userPrompt: string, systemPrompt?: string): Promise<T> {
-    const raw = await this.chat(userPrompt, systemPrompt);
+  async chatJSON<T>(
+    userPrompt: string,
+    systemPrompt?: string,
+    options?: { temperature?: number; max_tokens?: number }
+  ): Promise<T> {
+    const raw = await this.chat(userPrompt, systemPrompt, options);
     try {
       return parseLLMJson<T>(raw);
     } catch (parseError) {

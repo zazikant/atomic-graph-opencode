@@ -1,4 +1,4 @@
-import { OpenCodeClient } from "./opencodeClient";
+import { OpenCodeClient, calculateMaxTokens, getStageTemperature, estimateTokens } from "./opencodeClient";
 import type {
   AtomicNode,
   ExtractResult,
@@ -20,6 +20,10 @@ import type {
  * - ErrorEntry tracking: Full error history for surgical, targeted fixes
  * - resumeFrom state machine: Deterministic pipeline progression
  * - Activity-style discrete steps: extract → link → validate → refine
+ * - Stage-specific system prompts: Each stage has its own optimized prompt
+ * - Stage-specific temperatures: extract=0.3, link=0.3, validate=0.1, refine=0.2
+ * - Dynamic max_tokens: Calculated from input length (from repo 2)
+ * - Echo detection: Detects when LLM echoes input unchanged
  *
  * Pipeline flow:
  * 1. Extract concepts (with 1500-char chunking for large inputs)
@@ -35,9 +39,6 @@ import type {
  *  Keeps prompts manageable and within the API's processing capacity. */
 const CHUNK_CHAR_LIMIT = 1500;
 
-/** Minimum characters that trigger chunked processing */
-const CHUNK_THRESHOLD = 1000;
-
 // ─── DSPy-style Error Tracking ─────────────────────────────────
 
 interface ErrorEntry {
@@ -47,15 +48,15 @@ interface ErrorEntry {
   issues?: string[];
 }
 
-// ─── System Prompt ─────────────────────────────────────────────
+// ─── Stage-Specific System Prompts (from ax-opencode-translator) ──────
+// Like repo 2's translate/validate/refine prompts — each stage has its
+// own specialized system prompt that focuses the LLM on its specific task.
+// This is the core of the AX DSPy pattern: structured prompting per stage.
 
-const SYSTEM_PROMPT = `You are a semantic reasoning engine that builds knowledge graphs from raw thinking.
+const EXTRACT_SYSTEM_PROMPT = `You are a semantic reasoning engine specialized in extracting atomic concepts from raw thinking.
 You do NOT merely reformat or summarise — you REASON through the semantic space of ideas.
 You surface implicit structure the writer already knows but didn't articulate.
 You infer missing concepts, bridge gaps, and make hidden relationships explicit.
-QUALITY MATTERS: you preserve the writer's original meaning faithfully.
-You do NOT over-process, hallucinate, or add unnecessary complexity.
-When the original notes are already clear and complete, you recognise that and score high.
 
 CRITICAL OUTPUT RULES:
 - Always respond with valid JSON only. No markdown, no explanation, no code fences.
@@ -64,7 +65,70 @@ CRITICAL OUTPUT RULES:
 - Keep titles short: 2-5 words.
 - Use minimal tags: 1-3 per node.
 - Do NOT repeat the input text verbatim in summaries — distill the core idea.
-- Avoid overly verbose edge labels — use 1-3 word specific verbs.`;
+- Each concept must be ONE idea only — split compound ideas.
+- Preserve the writer's original meaning faithfully.`;
+
+const EXTRACT_RETRY_SYSTEM_PROMPT = `You are a semantic reasoning engine specialized in extracting atomic concepts. The previous attempt did not extract concepts properly.
+
+CRITICAL: You MUST extract atomic concepts from the notes — do NOT echo the input text unchanged.
+
+CRITICAL OUTPUT RULES:
+- Always respond with valid JSON only. No markdown, no explanation, no code fences.
+- Every response must be a single valid JSON object parseable by JSON.parse().
+- Each concept = ONE idea only. Split compound ideas into separate concepts.
+- Be CONCISE: short titles (2-5 words), brief summaries (1-2 sentences).
+- Tags: 1-3 descriptive tags per node.
+- Do NOT repeat the input text verbatim — distill the core idea.`;
+
+const LINK_SYSTEM_PROMPT = `You are a semantic relationship mapper that discovers connections between concepts.
+You find both direct and implicit relationships — the hidden structure that connects ideas.
+You use SPECIFIC verbs for edge labels, never generic ones like "related to".
+
+CRITICAL OUTPUT RULES:
+- Always respond with valid JSON only. No markdown, no explanation, no code fences.
+- Every response must be a single valid JSON object parseable by JSON.parse().
+- Edge labels: use SPECIFIC verbs ("requires", "enables", "feeds into", "constrains", "extends"), NOT generic "related to".
+- Keep labels to 1-3 words.
+- Only create edges for REAL relationships. Do NOT fabricate connections.
+- Return ONLY edges — do NOT repeat nodes.`;
+
+const VALIDATE_SYSTEM_PROMPT = `You are a knowledge graph quality reviewer. Evaluate the provided graph and respond in JSON format.
+
+Evaluate on these criteria (weight: semantic fidelity > atomicity > completeness > relationships > structure):
+1. SEMANTIC FIDELITY: Does it preserve the writer's meaning? Minor wording changes don't lower score.
+2. ATOMICITY: Is each concept truly one idea?
+3. COMPLETENESS: Are implicit concepts captured?
+4. RELATIONSHIP QUALITY: Specific edge labels ("requires") vs lazy ones ("related to")?
+5. STRUCTURAL INTEGRITY: Orphan nodes? Missing cross-links?
+
+Respond in this exact JSON format:
+{
+  "score": 0.85,
+  "issues": ["issue1", "issue2"],
+  "suggestions": ["suggestion1"]
+}
+
+Scoring:
+- 0.90-1.00: Faithful representation, minor wording differences only
+- 0.75-0.89: Minor gaps
+- 0.50-0.74: Significant gaps
+- 0.00-0.49: Major problems
+
+Be FAIR — clear notes + good graph = high score. Don't invent reasons to lower it.
+Only list issues affecting MEANING or STRUCTURE.`;
+
+const REFINE_SYSTEM_PROMPT = `You are a knowledge graph refinement engine. Fix the identified issues while preserving what already works.
+Output ONLY the corrected knowledge graph in JSON, nothing else.
+
+CRITICAL OUTPUT RULES:
+- Always respond with valid JSON only. No markdown, no explanation, no code fences.
+- Every response must be a single valid JSON object parseable by JSON.parse().
+- Preserve writer's wording where accurate — only fix SEMANTIC or STRUCTURAL problems.
+- Missing bridge? INFER and add it.
+- Generic edge? Replace with specific verb.
+- Non-atomic concept? SPLIT into two and link.
+- No speculative additions.
+- Be CONCISE: short titles, brief summaries, 1-3 word edge labels.`;
 
 // ─── compileRefinePrompt — pure function (DSPy-like) ──────────────
 // Like DSPy's Module.compile() — produces focused prompts based on error history.
@@ -103,6 +167,23 @@ ${latestError.issues ? `Issues: ${latestError.issues.join(", ")}` : ""}`
     : "";
 
   return `Refinement context for stage "${stage}":${issueContext}${errorContext}${previousContext}`;
+}
+
+// ─── Echo Detection ─────────────────────────────────────────────
+// If the LLM returns the same text it was given (instead of extracting
+// concepts), we detect it and retry with a more forceful prompt.
+// Pattern from ax-opencode-translator's isEcho() function.
+
+function isEcho(originalText: string, extractedText: string): boolean {
+  const normalize = (s: string) => s.trim().toLowerCase().replace(/\s+/g, ' ');
+  // Check if the extracted text is mostly the same as the input
+  // (LLM sometimes just echoes input instead of extracting concepts)
+  const normOrig = normalize(originalText);
+  const normExtr = normalize(extractedText);
+  // If the extracted text is >80% similar to the input, it's an echo
+  if (normExtr.length < 10) return false; // Too short to be meaningful
+  const overlap = normOrig.includes(normExtr.substring(0, Math.min(200, normExtr.length)));
+  return overlap && normExtr.length > normOrig.length * 0.5;
 }
 
 // ─── AX Pipeline ───────────────────────────────────────────────
@@ -286,12 +367,16 @@ export class AXPipeline {
   private async extractChunk(
     chunk: string,
     chunkIndex: number,
-    totalChunks: number
+    totalChunks: number,
+    isRetry: boolean = false
   ): Promise<ExtractResult> {
     const contextHint =
       totalChunks > 1
         ? `\n\n[This is part ${chunkIndex + 1} of ${totalChunks} of the input. Focus on concepts in this section. Use tags to link related ideas across sections.]`
         : "";
+
+    // Use retry-specific prompt when echo detected (from ax-opencode-translator pattern)
+    const systemPrompt = isRetry ? EXTRACT_RETRY_SYSTEM_PROMPT : EXTRACT_SYSTEM_PROMPT;
 
     const prompt = `Extract atomic concepts from these notes. Each concept = ONE idea only.
 
@@ -308,7 +393,15 @@ Return JSON: { "nodes": [{ "id": "c1", "title": "...", "summary": "...", "tags":
 Raw notes:${contextHint}
 ${chunk}`;
 
-    const result = await this.client.chatJSON<ExtractResult>(prompt, SYSTEM_PROMPT);
+    // AX DSPy: stage-specific temperature and dynamic max_tokens
+    const temperature = getStageTemperature('extract');
+    const maxTokens = calculateMaxTokens(chunk, 'extract');
+
+    const result = await this.client.chatJSON<ExtractResult>(
+      prompt,
+      systemPrompt,
+      { temperature, max_tokens: maxTokens }
+    );
 
     if (!result.nodes || !Array.isArray(result.nodes)) {
       throw new Error("Extract step returned invalid nodes array");
@@ -369,6 +462,22 @@ ${chunk}`;
           `Extract (section ${i + 1}/${chunks.length})`,
           "extract"
         );
+
+        // Echo detection per chunk (from ax-opencode-translator pattern)
+        if (isEcho(chunks[i], JSON.stringify(chunkResult))) {
+          console.log(`[AX Pipeline] Echo detected in chunk ${i + 1} — retrying with forceful prompt`);
+          try {
+            const retryResult = await this.extractChunk(chunks[i], i, chunks.length, true);
+            retryResult.nodes.forEach((node) => {
+              node.id = `s${i + 1}_${node.id}`;
+            });
+            allNodes.push(...retryResult.nodes);
+            succeededChunks++;
+            continue;
+          } catch {
+            // Retry failed, use original result
+          }
+        }
 
         chunkResult.nodes.forEach((node) => {
           node.id = `s${i + 1}_${node.id}`;
@@ -449,7 +558,15 @@ Fix rules:
 
 Return JSON: { "nodes": [{ "id": "c1", "title": "...", "summary": "...", "tags": ["..."] }] }`;
 
-    const result = await this.client.chatJSON<ExtractResult>(prompt, SYSTEM_PROMPT);
+    // AX DSPy: use REFINE system prompt with refinement temperature
+    const temperature = getStageTemperature('refine');
+    const maxTokens = calculateMaxTokens(rawNotes, 'extract');
+
+    const result = await this.client.chatJSON<ExtractResult>(
+      prompt,
+      REFINE_SYSTEM_PROMPT,
+      { temperature, max_tokens: maxTokens }
+    );
 
     if (!result.nodes || !Array.isArray(result.nodes)) {
       throw new Error("Extract refinement returned invalid nodes array");
@@ -497,7 +614,15 @@ Return JSON: { "edges": [{ "source": "nodeId", "target": "nodeId", "label": "ver
 Nodes (id: title):
 ${nodeSummary}`;
 
-    const result = await this.client.chatJSON<LinkResult>(prompt, SYSTEM_PROMPT);
+    // AX DSPy: LINK stage-specific temperature and dynamic max_tokens
+    const temperature = getStageTemperature('link');
+    const maxTokens = calculateMaxTokens(nodeSummary, 'link');
+
+    const result = await this.client.chatJSON<LinkResult>(
+      prompt,
+      LINK_SYSTEM_PROMPT,
+      { temperature, max_tokens: maxTokens }
+    );
 
     const nodeIds = new Set(extracted.nodes.map((n) => n.id));
     const validEdges = (result.edges || [])
@@ -562,9 +687,14 @@ Graph: ${JSON.stringify(graphCompact)}
 Return JSON: { "score": 0.85, "issues": ["..."], "suggestions": ["..."] }
 Only list issues affecting MEANING or STRUCTURE.`;
 
+    // AX DSPy: VALIDATE stage uses lowest temperature for objective assessment
+    const temperature = getStageTemperature('validate');
+    const maxTokens = calculateMaxTokens('', 'validate'); // Returns 1024 for validate
+
     const result = await this.client.chatJSON<ValidationResult>(
       prompt,
-      SYSTEM_PROMPT
+      VALIDATE_SYSTEM_PROMPT,
+      { temperature, max_tokens: maxTokens }
     );
 
     return {
@@ -613,7 +743,16 @@ ${issues.map((i) => `- ${i}`).join("\n")}
 
 Current graph: ${JSON.stringify(graphCompact)}`;
 
-    const result = await this.client.chatJSON<LinkResult>(prompt, SYSTEM_PROMPT);
+    // AX DSPy: REFINE stage uses slightly higher temperature for creative fixes
+    const temperature = getStageTemperature('refine');
+    const graphStr = JSON.stringify(graphCompact);
+    const maxTokens = calculateMaxTokens(graphStr, 'refine');
+
+    const result = await this.client.chatJSON<LinkResult>(
+      prompt,
+      REFINE_SYSTEM_PROMPT,
+      { temperature, max_tokens: maxTokens }
+    );
 
     const nodeIds = new Set((result.nodes || []).map((n) => n.id));
     const validEdges = (result.edges || [])
@@ -653,6 +792,12 @@ Current graph: ${JSON.stringify(graphCompact)}`;
   // ─── Main Pipeline Runner (resumeFrom state machine) ───────────
   // Like ax-opencode-translator's resumeFrom pattern — deterministic
   // pipeline progression with state tracking.
+  //
+  // KEY FIX: Results are carried FORWARD between stages, not re-computed.
+  // This matches repo 2's pattern where translate → validate → refine
+  // passes the same result through without re-running earlier stages.
+  //
+  // Flow: extract → link → validate → (if fail) refine → validate → done
 
   async run(
     rawNotes: string,
@@ -671,45 +816,45 @@ Current graph: ${JSON.stringify(graphCompact)}`;
     type PipelineStage = "extract" | "link" | "validate" | "refine" | "done";
     let resumeFrom: PipelineStage = "extract";
 
-    while (attempt < iterations && score < threshold && resumeFrom !== "done") {
+    // ─── Stage 1: EXTRACT (runs once, result carried forward) ──────
+    if (resumeFrom === "extract") {
       attempt++;
+      this.emit("extracting", attempt, 0, false);
+      let extracted: ExtractResult;
+      try {
+        extracted = await this.callWithRetryAwareness(
+          () => this.extract(rawNotes, null, []),
+          attempt,
+          "Extract",
+          "extract"
+        );
 
-      // ─── Stage 1: EXTRACT ──────────────────────────────────────
-      if (resumeFrom === "extract") {
-        this.emit("extracting", attempt, 0, false);
-        let extracted: ExtractResult;
-        try {
-          extracted = await this.callWithRetryAwareness(
-            () => this.extract(rawNotes, result, currentIssues),
-            attempt,
-            "Extract",
-            "extract"
-          );
-          resumeFrom = "link";
-        } catch (extractError) {
-          if (result) {
-            console.warn("[AX Pipeline] Extract failed, using previous result");
-            extracted = { nodes: result.nodes };
-            resumeFrom = "link";
-          } else {
-            throw extractError;
+        // Echo detection (from ax-opencode-translator pattern)
+        if (isEcho(rawNotes, JSON.stringify(extracted))) {
+          console.log("[AX Pipeline] Echo detected in extract — retrying with forceful prompt");
+          try {
+            const retryExtracted = await this.callWithRetryAwareness(
+              () => this.extract(rawNotes, null, []),
+              attempt,
+              "Extract (echo retry)",
+              "extract"
+            );
+            extracted = retryExtracted;
+          } catch {
+            // Retry failed, use original result
           }
         }
+
+        resumeFrom = "link";
+      } catch (extractError) {
+        throw extractError;
       }
 
-      // ─── Stage 2: LINK ─────────────────────────────────────────
+      // ─── Stage 2: LINK (runs once after extract, result carried) ──
       if (resumeFrom === "link") {
         this.emit("linking", attempt, 0, false);
-        let linked: LinkResult;
         try {
-          // Re-extract if needed for the link step
-          const extracted = await this.callWithRetryAwareness(
-            () => this.extract(rawNotes, result, currentIssues),
-            attempt,
-            "Extract for Link",
-            "extract"
-          );
-          linked = await this.callWithRetryAwareness(
+          result = await this.callWithRetryAwareness(
             () => this.link(extracted),
             attempt,
             "Link",
@@ -718,34 +863,24 @@ Current graph: ${JSON.stringify(graphCompact)}`;
           resumeFrom = "validate";
         } catch (linkError) {
           console.warn("[AX Pipeline] Link failed, using nodes without edges");
-          const extracted = await this.extract(rawNotes, result, currentIssues).catch(() => ({
-            nodes: result?.nodes || [],
-          }));
-          linked = { nodes: extracted.nodes, edges: [] };
+          result = { nodes: extracted.nodes, edges: [] };
           resumeFrom = "validate";
         }
       }
+    }
 
+    // ─── Validate → Refine loop (carries result forward like repo 2) ──
+    // This matches ax-opencode-translator's pattern:
+    //   translate → validate → (if fail) refine → revalidate → done
+    // Here: extract+link already done → validate → (if fail) refine → validate → done
+
+    while (attempt < iterations && score < threshold && resumeFrom !== "done") {
       // ─── Stage 3: VALIDATE ─────────────────────────────────────
       if (resumeFrom === "validate") {
         this.emit("validating", attempt, 0, false);
         try {
-          // Get the latest linked result
-          const extracted = await this.callWithRetryAwareness(
-            () => this.extract(rawNotes, result, currentIssues),
-            attempt,
-            "Extract for Validate",
-            "extract"
-          );
-          const linked = await this.callWithRetryAwareness(
-            () => this.link(extracted),
-            attempt,
-            "Link for Validate",
-            "link"
-          );
-
           const validation = await this.callWithRetryAwareness(
-            () => this.validate(linked),
+            () => this.validate(result!),
             attempt,
             "Validate",
             "validate"
@@ -766,18 +901,15 @@ Current graph: ${JSON.stringify(graphCompact)}`;
           });
 
           if (passed) {
-            result = linked;
             resumeFrom = "done";
           } else if (attempt < iterations) {
             resumeFrom = "refine";
           } else {
-            result = linked;
             resumeFrom = "done";
           }
         } catch (validateError) {
           console.warn("[AX Pipeline] Validate failed, using default score");
           score = 0.7;
-          result = { nodes: result?.nodes || [], edges: result?.edges || [] };
           currentIssues = ["Validation step failed — using estimated score"];
 
           iterLogs.push({
@@ -801,6 +933,7 @@ Current graph: ${JSON.stringify(graphCompact)}`;
 
       // ─── Stage 4: REFINE (DSPy-compiled prompt) ────────────────
       if (resumeFrom === "refine") {
+        attempt++;
         this.emit("refining", attempt, score, false);
         try {
           const refined = await this.callWithRetryAwareness(
@@ -810,10 +943,10 @@ Current graph: ${JSON.stringify(graphCompact)}`;
             "refine"
           );
           result = refined;
-          // After refine, loop back to validate
+          // After refine, loop back to validate (like repo 2's revalidate)
           resumeFrom = "validate";
         } catch (refineError) {
-          console.warn("[AX Pipeline] Refine failed, using current result");
+          console.warn("[AX Pipeline] Refine failed, keeping current result");
           // Keep current result, loop back to validate
           resumeFrom = "validate";
         }
