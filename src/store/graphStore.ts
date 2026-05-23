@@ -67,7 +67,7 @@ function loadStoredConfig(): AppConfig {
     if (stored) {
       const parsed = JSON.parse(stored);
       // Always ensure model is the current default
-      return { ...parsed, model: "glm-5.1" };
+      return { ...parsed, model: "glm-5.1", fastMode: parsed.fastMode ?? true };
     }
   } catch {
     // ignore
