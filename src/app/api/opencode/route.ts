@@ -55,7 +55,8 @@ function describeStatus(status: number): string {
  * Features:
  * - Retry up to 3 times on transient errors (429, 5xx) with 15-second delay
  * - Graceful error handling with descriptive messages
- * - reasoning_effort: "none" disables thinking so all tokens go to output
+ * - reasoning_effort: "low" keeps GLM 5.3's reasoning overhead minimal
+ *   (GLM 5.3 is thinking-only and rejects "none")
  * - Passes through retry metadata so the client can display status
  */
 export async function POST(request: NextRequest) {
@@ -87,15 +88,16 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Build request body with reasoning_effort: "none" to disable thinking
-    // This ensures all max_tokens go to content output, preventing the
-    // "empty content" bug where reasoning consumes all tokens.
+    // Build request body with reasoning_effort: "low".
+    // GLM 5.3 (currently served behind the glm-5.1 alias on opencode.ai/zen/go)
+    // is a thinking-only model and rejects "none" with HTTP 400. "low" keeps
+    // reasoning overhead minimal while still producing the final answer in content.
     const requestBody = JSON.stringify({
       model,
       messages,
       temperature: temperature ?? 0.7,
       max_tokens: max_tokens ?? 16384,
-      reasoning_effort: "none",
+      reasoning_effort: "low",
       stream: false,
     });
 

@@ -1,19 +1,19 @@
 /**
  * OpenCode API Client — OpenAI Chat Completions interface
  *
- * Calls the GLM 5.1 model via the OpenAI-compatible chat completions endpoint
+ * Calls the GLM model via the OpenAI-compatible chat completions endpoint
  * through our Next.js proxy route to avoid browser CORS restrictions.
  *
  * Base URL: https://opencode.ai/zen/go
- * Default model: glm-5.1
+ * Default model: glm-5.1 (alias — gateway currently serves GLM 5.3 behind it)
  * Endpoint: /v1/chat/completions (OpenAI-compatible)
  * Auth: Authorization: Bearer header
  *
- * GLM 5.1 is a thinking/reasoning model. We disable thinking via
- * reasoning_effort: "none" — this turns off internal reasoning so ALL
- * max_tokens go to content output. This prevents the "empty content" bug
- * where reasoning consumes all tokens. Quality is maintained through the
- * detailed system prompt in axPipeline.ts.
+ * GLM 5.3 is a thinking-only model — reasoning_effort: "none" is rejected
+ * with HTTP 400 (error 1210). We use reasoning_effort: "low" to keep
+ * reasoning overhead minimal while still producing the final answer in
+ * `content`. Quality is maintained through the detailed system prompt in
+ * axPipeline.ts.
  */
 
 import type { OpenCodeModel } from "./types";
@@ -31,8 +31,9 @@ export function estimateTokens(text: string): number {
 
 /**
  * Calculate max_tokens for the output based on input length.
- * With reasoning_effort: "none", thinking is OFF — all tokens go to content.
- * No need to reserve tokens for reasoning, so minimum can be lower.
+ * With reasoning_effort: "low", reasoning is enabled but minimal — most
+ * tokens still go to content output. The minimum stays low to keep
+ * validation responses cheap.
  *
  * For knowledge graph extraction, output can be 2-3× the input
  * (notes → structured graph with nodes and edges).
@@ -48,7 +49,7 @@ export function calculateMaxTokens(inputText: string, stage: 'extract' | 'link' 
   // Knowledge graph extraction produces structured output ≈ 2× input
   const multiplier = stage === 'extract' ? 2 : 1.5;
   const outputTokens = Math.ceil(inputTokens * multiplier);
-  // With reasoning_effort "none", no tokens are consumed by reasoning
+  // With reasoning_effort "low", reasoning overhead is small but non-zero
   return Math.max(2048, Math.min(8192, outputTokens));
 }
 
