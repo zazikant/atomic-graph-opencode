@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { randomUUID } from "node:crypto";
 
 const OPENCODE_BASE_URL = "https://opencode.ai/zen/go";
 
@@ -114,6 +115,16 @@ export async function POST(request: NextRequest) {
           headers: {
             "Content-Type": "application/json",
             Authorization: `Bearer ${effectiveApiKey}`,
+            // OpenCode gateway requires this header for routing — see
+            // https://opencode.ai/docs/go/#where-can-i-use-it. Without it,
+            // the gateway returns HTTP 400 MissingSessionID (enforcement
+            // tightened 2026-09-06). Allow a caller-provided sessionId for
+            // cache affinity across multiple calls in one pipeline run;
+            // otherwise generate a fresh UUID per request.
+            "x-opencode-session":
+              typeof body.sessionId === "string" && body.sessionId.length > 0
+                ? body.sessionId
+                : randomUUID(),
           },
           body: requestBody,
         });
