@@ -56,7 +56,7 @@ function loadStoredConfig(): AppConfig {
   if (typeof window === "undefined") {
     return {
       apiKey: DEFAULT_API_KEY,
-      model: "glm-5.1",
+      model: "glm-5.2",
       iterations: 3,
       confidenceThreshold: 0.75,
       fastMode: true,
@@ -67,14 +67,14 @@ function loadStoredConfig(): AppConfig {
     if (stored) {
       const parsed = JSON.parse(stored);
       // Always ensure model is the current default
-      return { ...parsed, model: "glm-5.1", fastMode: parsed.fastMode ?? true };
+      return { ...parsed, model: "glm-5.2", fastMode: parsed.fastMode ?? true };
     }
   } catch {
     // ignore
   }
   return {
     apiKey: DEFAULT_API_KEY,
-    model: "glm-5.1",
+    model: "glm-5.2",
     iterations: 3,
     confidenceThreshold: 0.75,
     fastMode: true,

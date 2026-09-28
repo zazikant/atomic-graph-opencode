@@ -90,7 +90,7 @@ export async function POST(request: NextRequest) {
     }
 
     // Build request body with reasoning_effort: "low".
-    // GLM 5.3 (currently served behind the glm-5.1 alias on opencode.ai/zen/go)
+    // GLM 5.3 (currently served behind the glm-5.2 alias on opencode.ai/zen/go)
     // is a thinking-only model and rejects "none" with HTTP 400. "low" keeps
     // reasoning overhead minimal while still producing the final answer in content.
     const requestBody = JSON.stringify({

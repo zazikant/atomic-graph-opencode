@@ -5,7 +5,7 @@
  * through our Next.js proxy route to avoid browser CORS restrictions.
  *
  * Base URL: https://opencode.ai/zen/go
- * Default model: glm-5.1 (alias — gateway currently serves GLM 5.3 behind it)
+ * Default model: glm-5.2 (alias — gateway currently serves GLM 5.3 behind it)
  * Endpoint: /v1/chat/completions (OpenAI-compatible)
  * Auth: Authorization: Bearer header
  *
@@ -18,7 +18,7 @@
 
 import type { OpenCodeModel } from "./types";
 
-const DEFAULT_MODEL: OpenCodeModel = "glm-5.1";
+const DEFAULT_MODEL: OpenCodeModel = "glm-5.2";
 
 // ─── Token Estimation (from ax-opencode-translator) ──────────
 // Rough: 1 token ≈ 4 chars for English, 2 chars for CJK
