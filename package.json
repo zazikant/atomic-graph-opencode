@@ -2,7 +2,7 @@
   "name": "atomic-graph",
   "version": "1.0.0",
   "private": true,
-  "description": "Transform raw notes into interactive knowledge graphs using AI semantic reasoning powered by OpenCode API (GLM 5.1)",
+  "description": "Transform raw notes into interactive knowledge graphs using AI semantic reasoning powered by OpenCode API (GLM 5.3)",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
