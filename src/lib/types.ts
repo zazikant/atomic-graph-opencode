@@ -65,10 +65,10 @@ export interface AppConfig {
   fastMode: boolean;
 }
 
-export type OpenCodeModel = "glm-5.2";
+export type OpenCodeModel = "glm-5.3";
 
 export const OPENCODE_MODELS: { value: OpenCodeModel; label: string }[] = [
-  { value: "glm-5.2", label: "GLM 5.2" },
+  { value: "glm-5.3", label: "GLM 5.3" },
 ];
 
 // ─── Cluster Colour Palette ──────────────────────────────────

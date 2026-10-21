@@ -56,7 +56,7 @@ export function ConfigBar() {
           className="bg-[#1a1a3e] text-[#c8c8ee] font-mono text-[10px] border border-[#3a3a6a] px-2 py-0.5 shrink-0 hidden sm:flex"
         >
           <Cpu className="w-3 h-3 mr-1" />
-          GLM 5.1
+          GLM 5.3
         </Badge>
 
         {/* Mobile: expand/collapse toggle */}
@@ -85,7 +85,7 @@ export function ConfigBar() {
             variant="secondary"
             className="bg-[#1a1a3e] text-[#c8c8ee] font-mono text-[10px] border border-[#3a3a6a] px-2 py-0.5"
           >
-            GLM 5.1
+            GLM 5.3
           </Badge>
         </div>
 

@@ -5,7 +5,7 @@
  * through our Next.js proxy route to avoid browser CORS restrictions.
  *
  * Base URL: https://opencode.ai/zen/go
- * Default model: glm-5.2 (alias — gateway currently serves GLM 5.3 behind it)
+ * Default model: glm-5.3 (GLM 5.3 thinking model)
  * Endpoint: /v1/chat/completions (OpenAI-compatible)
  * Auth: Authorization: Bearer header
  *
@@ -18,7 +18,7 @@
 
 import type { OpenCodeModel } from "./types";
 
-const DEFAULT_MODEL: OpenCodeModel = "glm-5.2";
+const DEFAULT_MODEL: OpenCodeModel = "glm-5.3";
 
 // ─── Token Estimation (from ax-opencode-translator) ──────────
 // Rough: 1 token ≈ 4 chars for English, 2 chars for CJK
@@ -175,7 +175,7 @@ export class OpenCodeClient {
       throw new Error("OpenCode API returned no message in response");
     }
 
-    // GLM 5.1 returns reasoning in reasoning_content and the final answer in content.
+    // GLM 5.3 returns reasoning in reasoning_content and the final answer in content.
     // If content is empty (token limit hit during reasoning), fall back to reasoning_content.
     const content = message.content || message.reasoning_content;
 
