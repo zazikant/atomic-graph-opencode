@@ -1,12 +1,12 @@
 # Atomic Graph — AI-Powered Knowledge Graph Builder
 
-Transform raw notes into interactive knowledge graphs using AI semantic reasoning powered by the OpenCode API (GLM 5.1).
+Transform raw notes into interactive knowledge graphs using AI semantic reasoning powered by the OpenCode API (GLM 5.3).
 
 ## Features
 
 - **AX DSPy-style Pipeline**: Extract → Link → Validate → Refine loop
 - **1500-character Chunking**: Processes large inputs in 1500-char segments
-- **OpenCode API**: Uses GLM 5.1 with `reasoning_effort: "none"` for reliable output
+- **OpenCode API**: Uses GLM 5.3 with `reasoning_effort: "low"` for reliable output
 - **Interactive Graph Visualization**: ReactFlow-powered knowledge graph
 - **JSON Import/Export**: Import graphs from JSON or AI-generated results
 - **Vercel Compatible**: Deploy with a single environment variable
@@ -59,7 +59,7 @@ Content-Type: application/json
 ```json
 {
   "apiKey": "YOUR_OPENCODE_API_KEY",
-  "model": "glm-5.1",
+  "model": "glm-5.3",
   "messages": [
     { "role": "system", "content": "<SYSTEM_PROMPT>" },
     { "role": "user", "content": "<USER_PROMPT>" }
@@ -96,7 +96,7 @@ repeat up to N iterations (default: 3):
 ### Key Design Decisions
 
 - **1500-char chunking**: Keeps prompts within the OpenCode API's optimal processing range
-- **reasoning_effort: "none"**: Disables GLM 5.1's internal reasoning so all `max_tokens` go to content output
+- **reasoning_effort: "low"**: GLM 5.3 is thinking-only and rejects "none" — "low" keeps reasoning overhead minimal so most `max_tokens` go to content output
 - **Proxy route**: Server-side `/api/opencode` route bypasses CORS restrictions
 - **Retry logic**: 3 retries with 15s delay for 429/5xx errors
 
@@ -131,4 +131,4 @@ repeat up to N iterations (default: 3):
 - **ReactFlow** for graph visualization
 - **Zustand** for state management
 - **Dagre** for automatic graph layout
-- **OpenCode API** (GLM 5.1) for AI processing
+- **OpenCode API** (GLM 5.3) for AI processing
